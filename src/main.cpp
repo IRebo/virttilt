@@ -13,6 +13,8 @@
 #include <shellapi.h>
 #include <objbase.h>
 #include <servprov.h>
+#include <shobjidl.h>
+#include <dwmapi.h>
 
 #include <stdarg.h>
 #include <wchar.h>
@@ -224,6 +226,10 @@ public:
             m_pShell->Release();
             m_pShell = nullptr;
         }
+        if (m_pVdm) {
+            m_pVdm->Release();
+            m_pVdm = nullptr;
+        }
         m_initialized = false;
     }
 
@@ -258,14 +264,25 @@ public:
                 m_matchedIid = iid;
                 m_initialized = true;
                 Log("VirtualDesktop API: connected with IID {%08lX-...} (Windows build %lu)", iid.Data1, m_buildNumber);
-                return true;
+                break;
             }
         }
 
-        Log("VirtualDesktop API: failed to query IVirtualDesktopManagerInternal");
-        Release();
-        return false;
+        if (!m_pInternal) {
+            Log("VirtualDesktop API: failed to query IVirtualDesktopManagerInternal");
+            Release();
+            return false;
+        }
+
+        if (!m_pVdm) {
+            CoCreateInstance(CLSID_VirtualDesktopManager, nullptr, CLSCTX_INPROC_SERVER,
+                             IID_IVirtualDesktopManager, reinterpret_cast<void**>(&m_pVdm));
+        }
+
+        return true;
     }
+
+    IVirtualDesktopManager* GetVdm() const { return m_pVdm; }
 
     int GetAnimationVTableIndex() const {
         if (m_buildNumber >= 26100) return 22; // Windows 11 24H2+ (e.g. 26100, 26300)
@@ -273,7 +290,8 @@ public:
         return -1;
     }
 
-    bool SwitchDesktop(bool next, bool animate) {
+    bool SwitchDesktop(bool next, bool animate, bool* didSwitch = nullptr) {
+        if (didSwitch) *didSwitch = false;
         if (!EnsureInitialized()) return false;
 
         void** vtbl = *reinterpret_cast<void***>(m_pInternal);
@@ -322,19 +340,28 @@ public:
                 hr = fnSwitchAnim(m_pInternal, pAdjacent);
                 reinterpret_cast<IUnknown*>(pAdjacent)->Release();
                 Log("VirtualDesktop API: SwitchDesktopWithAnimation result 0x%08lX", hr);
-                return SUCCEEDED(hr);
+                if (SUCCEEDED(hr)) {
+                    if (didSwitch) *didSwitch = true;
+                    return true;
+                }
+                return false;
             }
         }
 
         hr = fnSwitch(m_pInternal, pAdjacent);
         reinterpret_cast<IUnknown*>(pAdjacent)->Release();
         Log("VirtualDesktop API: SwitchDesktop result 0x%08lX", hr);
-        return SUCCEEDED(hr);
+        if (SUCCEEDED(hr)) {
+            if (didSwitch) *didSwitch = true;
+            return true;
+        }
+        return false;
     }
 
 private:
     IServiceProvider* m_pShell = nullptr;
     void* m_pInternal = nullptr;
+    IVirtualDesktopManager* m_pVdm = nullptr;
     IID m_matchedIid = {};
     DWORD m_buildNumber = 0;
     bool m_initialized = false;
@@ -387,61 +414,8 @@ bool IsKeyboardCapturingWindow(HWND hwnd) {
     return false;
 }
 
-// Moves keyboard focus to the taskbar (it lives on every virtual desktop), so
-// the capturing client's hook stops forwarding keys.
-void MoveFocusToTaskbar(HWND foreground) {
-    HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
-    if (!taskbar) return;
-
-    // We are not the foreground process, so SetForegroundWindow is normally
-    // refused. Attaching to the foreground thread's input queue lifts that.
-    const DWORD fgThread = GetWindowThreadProcessId(foreground, nullptr);
-    const DWORD self = GetCurrentThreadId();
-    const bool attached = fgThread && fgThread != self && AttachThreadInput(self, fgThread, TRUE);
-    SetForegroundWindow(taskbar);
-    if (attached) AttachThreadInput(self, fgThread, FALSE);
-
-    // Give the focus change a moment to take effect before injecting keys.
-    for (int i = 0; i < 20 && GetForegroundWindow() != taskbar; ++i) Sleep(5);
-    Log("moved focus to taskbar: %s", GetForegroundWindow() == taskbar ? "ok" : "FAILED");
-}
-
-void SwitchDesktopKeys(bool next) {
-    HWND foreground = GetForegroundWindow();
-    const bool capturing = IsKeyboardCapturingWindow(foreground);
-    if (g_logEnabled) {
-        char cls[64] = {};
-        GetClassNameA(foreground, cls, sizeof(cls));
-        Log("foreground window class=%s capturing=%d", cls, capturing);
-    }
-    if (capturing) {
-        MoveFocusToTaskbar(foreground);
-    }
-
-    const WORD arrow = next ? VK_RIGHT : VK_LEFT;
-    INPUT inputs[6] = {};
-    SetKey(inputs[0], VK_LCONTROL, false);
-    SetKey(inputs[1], VK_LWIN, false);
-    SetKey(inputs[2], arrow, false);
-    SetKey(inputs[3], arrow, true);
-    SetKey(inputs[4], VK_LWIN, true);
-    SetKey(inputs[5], VK_LCONTROL, true);
-    SendInput(ARRAYSIZE(inputs), inputs, sizeof(INPUT));
-}
-
-void SwitchDesktop(bool next) {
-    if (g_settings.useApi) {
-        if (g_vdApi.SwitchDesktop(next, g_settings.animate)) {
-            Log("switched desktop via API -> %s (animated=%d)", next ? "next" : "previous", g_settings.animate);
-            return;
-        }
-        Log("switch desktop via API failed, falling back to keystroke");
-    }
-    SwitchDesktopKeys(next);
-}
-
 // ---------------------------------------------------------------------------
-// Background worker thread for desktop switching
+// Background worker thread queue for desktop switching
 //
 // Desktop switching (especially COM SwitchDesktopWithAnimation) blocks for
 // ~180-230ms while the shell animates. If executed on the UI thread, it
@@ -481,6 +455,238 @@ bool DequeueSwitch(int& dir) {
     }
     LeaveCriticalSection(&g_queueCs);
     return found;
+}
+
+// ---------------------------------------------------------------------------
+// Window focus management and enumeration
+// ---------------------------------------------------------------------------
+
+void GetWindowDetails(HWND hwnd, char* outClass, int maxClass, char* outTitle, int maxTitle, char* outExe, int maxExe) {
+    if (maxClass > 0) outClass[0] = '\0';
+    if (maxTitle > 0) outTitle[0] = '\0';
+    if (maxExe > 0) outExe[0] = '\0';
+    if (!hwnd || !IsWindow(hwnd)) return;
+
+    if (maxClass > 0) GetClassNameA(hwnd, outClass, maxClass);
+    if (maxTitle > 0) GetWindowTextA(hwnd, outTitle, maxTitle);
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process) {
+        wchar_t path[MAX_PATH] = {};
+        DWORD size = ARRAYSIZE(path);
+        if (QueryFullProcessImageNameW(process, 0, path, &size)) {
+            const wchar_t* exe = path;
+            for (const wchar_t* p = path; *p; ++p) {
+                if (*p == L'\\') exe = p + 1;
+            }
+            WideCharToMultiByte(CP_ACP, 0, exe, -1, outExe, maxExe, nullptr, nullptr);
+        }
+        CloseHandle(process);
+    }
+}
+
+bool ForceForegroundWindow(HWND target) {
+    if (!target || !IsWindow(target)) return false;
+
+    HWND foreground = GetForegroundWindow();
+    if (foreground == target) return true;
+
+    const DWORD currentThread = GetCurrentThreadId();
+    const DWORD fgThread = foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
+    const DWORD targetThread = GetWindowThreadProcessId(target, nullptr);
+
+    bool attachedFg = false;
+    bool attachedTarget = false;
+
+    if (fgThread && fgThread != currentThread) {
+        attachedFg = (AttachThreadInput(currentThread, fgThread, TRUE) != FALSE);
+    }
+    if (targetThread && targetThread != currentThread && targetThread != fgThread) {
+        attachedTarget = (AttachThreadInput(currentThread, targetThread, TRUE) != FALSE);
+    }
+
+    AllowSetForegroundWindow(ASFW_ANY);
+    BringWindowToTop(target);
+    SetForegroundWindow(target);
+
+    // If still not foreground, simulate a neutral Alt keystroke to unlock permissions
+    if (GetForegroundWindow() != target) {
+        INPUT inputs[2] = {};
+        inputs[0].type = INPUT_KEYBOARD;
+        inputs[0].ki.wVk = VK_MENU;
+        inputs[1].type = INPUT_KEYBOARD;
+        inputs[1].ki.wVk = VK_MENU;
+        inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(2, inputs, sizeof(INPUT));
+        SetForegroundWindow(target);
+    }
+
+    if (attachedTarget) AttachThreadInput(currentThread, targetThread, FALSE);
+    if (attachedFg) AttachThreadInput(currentThread, fgThread, FALSE);
+
+    for (int i = 0; i < 10 && GetForegroundWindow() != target; ++i) {
+        Sleep(5);
+    }
+
+    return GetForegroundWindow() == target;
+}
+
+// Moves keyboard focus to the taskbar (it lives on every virtual desktop), so
+// the capturing client's hook stops forwarding keys.
+void MoveFocusToTaskbar(HWND foreground) {
+    (void)foreground;
+    HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (!taskbar) return;
+    const bool ok = ForceForegroundWindow(taskbar);
+    Log("moved focus to taskbar: %s", ok ? "ok" : "FAILED");
+}
+
+struct FindTopContext {
+    IVirtualDesktopManager* vdm = nullptr;
+    HWND found = nullptr;
+};
+
+bool IsEligibleTopWindow(HWND hwnd, IVirtualDesktopManager* vdm) {
+    if (!hwnd || hwnd == g_hwnd) return false;
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return false;
+
+    wchar_t cls[64] = {};
+    GetClassNameW(hwnd, cls, ARRAYSIZE(cls));
+    if (lstrcmpiW(cls, L"Shell_TrayWnd") == 0 ||
+        lstrcmpiW(cls, L"Shell_SecondaryTrayWnd") == 0 ||
+        lstrcmpiW(cls, L"Progman") == 0 ||
+        lstrcmpiW(cls, L"WorkerW") == 0 ||
+        lstrcmpiW(cls, L"Windows.UI.Core.CoreWindow") == 0) {
+        return false;
+    }
+
+    const LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if ((exStyle & WS_EX_TOOLWINDOW) && !(exStyle & WS_EX_APPWINDOW)) {
+        return false;
+    }
+
+    RECT rc;
+    if (!GetWindowRect(hwnd, &rc) || (rc.right - rc.left <= 0) || (rc.bottom - rc.top <= 0)) {
+        return false;
+    }
+
+    // Windows on inactive virtual desktops are cloaked by DWM.
+    DWORD cloaked = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked != 0) {
+        return false;
+    }
+
+    if (vdm) {
+        BOOL onCurrent = FALSE;
+        if (SUCCEEDED(vdm->IsWindowOnCurrentVirtualDesktop(hwnd, &onCurrent)) && !onCurrent) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+HWND FindTopWindowOnCurrentDesktop(IVirtualDesktopManager* vdm) {
+    if (g_queueHead != g_queueTail) return nullptr;
+
+    FindTopContext ctx = { vdm, nullptr };
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        ctx.found = nullptr;
+        EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+            auto* pCtx = reinterpret_cast<FindTopContext*>(lParam);
+            if (IsEligibleTopWindow(hwnd, pCtx->vdm)) {
+                pCtx->found = hwnd;
+                return FALSE;
+            }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&ctx));
+
+        if (ctx.found) {
+            HWND popup = GetLastActivePopup(ctx.found);
+            if (popup && IsWindow(popup) && IsWindowVisible(popup) && !IsIconic(popup)) {
+                DWORD cloaked = 0;
+                if (SUCCEEDED(DwmGetWindowAttribute(popup, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked == 0) {
+                    ctx.found = popup;
+                }
+            }
+            return ctx.found;
+        }
+
+        if (g_queueHead != g_queueTail) return nullptr;
+        Sleep(15);
+    }
+    return nullptr;
+}
+
+void FocusTopWindowOnCurrentDesktop() {
+    HWND target = FindTopWindowOnCurrentDesktop(g_vdApi.GetVdm());
+    if (!target) {
+        // Fallback: if no eligible top-level app window on new desktop,
+        // move focus to the taskbar to release any capturing/previous window.
+        target = FindWindowW(L"Shell_TrayWnd", nullptr);
+    }
+
+    if (target) {
+        if (g_logEnabled) {
+            char cls[64] = {}, title[128] = {}, exe[64] = {};
+            GetWindowDetails(target, cls, sizeof(cls), title, sizeof(title), exe, sizeof(exe));
+            Log("focusing window on new desktop: hwnd=%p exe=%s class=%s title='%s'",
+                target, exe, cls, title);
+        }
+
+        const bool ok = ForceForegroundWindow(target);
+        if (g_logEnabled) {
+            Log("focus transfer result: %s (active fg=%p)", ok ? "ok" : "FAILED", GetForegroundWindow());
+        }
+    }
+}
+
+void SwitchDesktopKeys(bool next) {
+    HWND foreground = GetForegroundWindow();
+    const bool capturing = IsKeyboardCapturingWindow(foreground);
+    if (g_logEnabled) {
+        char cls[64] = {};
+        GetClassNameA(foreground, cls, sizeof(cls));
+        Log("foreground window class=%s capturing=%d", cls, capturing);
+    }
+    if (capturing) {
+        MoveFocusToTaskbar(foreground);
+    }
+
+    const WORD arrow = next ? VK_RIGHT : VK_LEFT;
+    INPUT inputs[6] = {};
+    SetKey(inputs[0], VK_LCONTROL, false);
+    SetKey(inputs[1], VK_LWIN, false);
+    SetKey(inputs[2], arrow, false);
+    SetKey(inputs[3], arrow, true);
+    SetKey(inputs[4], VK_LWIN, true);
+    SetKey(inputs[5], VK_LCONTROL, true);
+    SendInput(ARRAYSIZE(inputs), inputs, sizeof(INPUT));
+}
+
+void SwitchDesktop(bool next) {
+    HWND fgBefore = GetForegroundWindow();
+    if (g_logEnabled) {
+        char cls[64] = {}, title[128] = {}, exe[64] = {};
+        GetWindowDetails(fgBefore, cls, sizeof(cls), title, sizeof(title), exe, sizeof(exe));
+        Log("before switch: fg=%p exe=%s class=%s title='%s'", fgBefore, exe, cls, title);
+    }
+
+    if (g_settings.useApi) {
+        bool didSwitch = false;
+        if (g_vdApi.SwitchDesktop(next, g_settings.animate, &didSwitch)) {
+            Log("switched desktop via API -> %s (animated=%d, didSwitch=%d)",
+                next ? "next" : "previous", g_settings.animate, didSwitch);
+            if (didSwitch) {
+                FocusTopWindowOnCurrentDesktop();
+            }
+            return;
+        }
+        Log("switch desktop via API failed, falling back to keystroke");
+    }
+    SwitchDesktopKeys(next);
 }
 
 DWORD WINAPI SwitchWorkerThread(LPVOID) {

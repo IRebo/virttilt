@@ -21,4 +21,4 @@ if(MSVC)
         $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF>)
 endif()
 
-target_link_libraries(VirtTilt PRIVATE user32 shell32 advapi32 gdi32 ole32)
+target_link_libraries(VirtTilt PRIVATE user32 shell32 advapi32 gdi32 ole32 dwmapi)
