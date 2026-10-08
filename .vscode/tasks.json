@@ -1,0 +1,45 @@
+{
+    "version": "2.0.0",
+    "options": {
+        "cwd": "${workspaceFolder}"
+    },
+    "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+    },
+    "tasks": [
+        {
+            "label": "CMake: Build Release (x64)",
+            "type": "process",
+            "command": "pwsh",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/build.ps1", "-Config", "Release"],
+            "group": "build",
+            "problemMatcher": "$msCompile"
+        },
+        {
+            "label": "CMake: Rebuild Release (x64, clean)",
+            "type": "process",
+            "command": "pwsh",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/build.ps1", "-Config", "Release", "-Clean"],
+            "group": "build",
+            "problemMatcher": "$msCompile"
+        },
+        {
+            "label": "CMake: Build Debug (x64)",
+            "type": "process",
+            "command": "pwsh",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/build.ps1", "-Config", "Debug"],
+            "group": "build",
+            "problemMatcher": "$msCompile"
+        },
+        {
+            "label": "Install VirtTilt (Release, autostart)",
+            "type": "process",
+            "command": "pwsh",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/install.ps1"],
+            "group": "build",
+            "problemMatcher": "$msCompile"
+        }
+    ]
+}
